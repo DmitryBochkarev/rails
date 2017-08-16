@@ -12,9 +12,36 @@ require 'active_support/core_ext/name_error'
 require 'active_support/core_ext/string/starts_ends_with'
 require 'active_support/inflector'
 
+require_relative "dependencies/interlock"
+
 module ActiveSupport #:nodoc:
   module Dependencies #:nodoc:
     extend self
+
+    mattr_accessor :interlock
+    self.interlock = Interlock.new
+
+    # :doc:
+
+    # Execute the supplied block without interference from any
+    # concurrent loads.
+    def self.run_interlock
+      Dependencies.interlock.running { yield }
+    end
+
+    # Execute the supplied block while holding an exclusive lock,
+    # preventing any other thread from being inside a #run_interlock
+    # block at the same time.
+    def self.load_interlock
+      Dependencies.interlock.loading { yield }
+    end
+
+    # Execute the supplied block while holding an exclusive lock,
+    # preventing any other thread from being inside a #run_interlock
+    # block at the same time.
+    def self.unload_interlock
+      Dependencies.interlock.unloading { yield }
+    end
 
     # Should we turn on Ruby warnings on the first load of dependent files?
     mattr_accessor :warnings_on_first_load
@@ -27,6 +54,9 @@ module ActiveSupport #:nodoc:
     # All files currently loaded.
     mattr_accessor :loaded
     self.loaded = Set.new
+
+    mattr_accessor :loading
+    self.loading = []
 
     # Should we load files or require them?
     mattr_accessor :mechanism
@@ -325,47 +355,58 @@ module ActiveSupport #:nodoc:
     end
 
     def clear
-      log_call
-      loaded.clear
-      remove_unloadable_constants!
+      Dependencies.unload_interlock do
+        log_call
+        loaded.clear
+        loading.clear
+        remove_unloadable_constants!
+      end
     end
 
     def require_or_load(file_name, const_path = nil)
-      log_call file_name, const_path
+      # log_call file_name, const_path
       file_name = $1 if file_name =~ /^(.*)\.rb$/
       expanded = File.expand_path(file_name)
       return if loaded.include?(expanded)
 
-      # Record that we've seen this file *before* loading it to avoid an
-      # infinite loop with mutual dependencies.
-      loaded << expanded
+      Dependencies.load_interlock do
+        # Maybe it got loaded while we were waiting for our lock:
+        return if loaded.include?(expanded)
 
-      begin
-        if load?
-          log "loading #{file_name}"
+        # Record that we've seen this file *before* loading it to avoid an
+        # infinite loop with mutual dependencies.
+        loaded << expanded
+        loading << expanded
 
-          # Enable warnings if this file has not been loaded before and
-          # warnings_on_first_load is set.
-          load_args = ["#{file_name}.rb"]
-          load_args << const_path unless const_path.nil?
+        begin
+          if load?
+            log "loading #{file_name}"
 
-          if !warnings_on_first_load or history.include?(expanded)
-            result = load_file(*load_args)
+            # Enable warnings if this file has not been loaded before and
+            # warnings_on_first_load is set.
+            load_args = ["#{file_name}.rb"]
+            load_args << const_path unless const_path.nil?
+
+            if !warnings_on_first_load or history.include?(expanded)
+              result = load_file(*load_args)
+            else
+              enable_warnings { result = load_file(*load_args) }
+            end
           else
-            enable_warnings { result = load_file(*load_args) }
+            # log "requiring #{file_name}"
+            result = require file_name
           end
-        else
-          log "requiring #{file_name}"
-          result = require file_name
+        rescue Exception
+          loaded.delete expanded
+          raise
+        ensure
+          loading.pop
         end
-      rescue Exception
-        loaded.delete expanded
-        raise
-      end
 
-      # Record history *after* loading so first load gets warnings.
-      history << expanded
-      return result
+        # Record history *after* loading so first load gets warnings.
+        history << expanded
+        return result
+      end
     end
 
     # Is the provided constant path defined?
@@ -498,10 +539,17 @@ module ActiveSupport #:nodoc:
 
       file_path = search_for_file(path_suffix)
 
-      if file_path && ! loaded.include?(File.expand_path(file_path).sub(/\.rb\z/, '')) # We found a matching file to load
-        require_or_load file_path
-        raise LoadError, "Expected #{file_path} to define #{qualified_name}" unless local_const_defined?(from_mod, const_name)
-        return from_mod.const_get(const_name)
+      if file_path
+        expanded = File.expand_path(file_path)
+        expanded.sub!(/\.rb\z/, "".freeze)
+
+        if (1..3).all? { |i| loading.include?(expanded) && !!(sleep i) }
+          raise "Circular dependency detected while autoloading constant #{qualified_name}"
+        else
+          require_or_load(expanded, qualified_name)
+          raise LoadError, "Unable to autoload constant #{qualified_name}, expected #{file_path} to define it" unless from_mod.const_defined?(const_name, false)
+          return from_mod.const_get(const_name)
+        end
       elsif mod = autoload_module!(from_mod, const_name, qualified_name, path_suffix)
         return mod
       elsif (parent = from_mod.parent) && parent != from_mod &&
